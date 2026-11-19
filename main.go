@@ -142,8 +142,9 @@ func main() {
 		Usage: "print only the version",
 	}
 	cmd := &cli.Command{
-		Name:  commandName,
-		Usage: "Logging of command input and output",
+		Name:         commandName,
+		Usage:        "Logging of command input and output",
+		StopOnNthArg: new(1),
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  dirFlag,
