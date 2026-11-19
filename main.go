@@ -42,15 +42,7 @@ func record(_ context.Context, file *os.File, argv []string) error {
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 
-	cols, rows, sizeErr := term.GetSize(os.Stdin.Fd())
-
-	var ptmx *os.File
-	var err error
-	if sizeErr == nil {
-		ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-	} else {
-		ptmx, err = pty.Start(cmd)
-	}
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("failed to start command, err=%v", err)
 		return err
@@ -86,8 +78,7 @@ func record(_ context.Context, file *os.File, argv []string) error {
 		}
 	}()
 
-	// Apply the initial size right away, so full-screen commands
-	// start with the real terminal size instead of 0x0.
+	// Initial resize
 	ch <- syscall.SIGWINCH
 
 	// Stdin -> PTY
