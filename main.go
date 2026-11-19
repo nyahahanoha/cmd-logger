@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -10,11 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -28,7 +30,299 @@ const (
 	defaultLogfile = "out"
 
 	defaultTimeFormat = "20060102_150405"
+
+	// Screen logging: the raw PTY stream is fed to a virtual terminal and
+	// the log is written as readable plain text (see screenLogger).
+	snapshotInterval   = 100 * time.Millisecond // how often to check for a new frame
+	snapshotSettle     = 200 * time.Millisecond // quiet period before a frame is captured
+	snapshotMaxDelay   = time.Second            // capture at least this often while output keeps flowing
+	snapshotTimeFormat = "2006-01-02 15:04:05"
+
+	// feedStep is the chunk size fed to the virtual terminal at a time on
+	// the normal screen, so scrolling can be tracked before lines are lost.
+	feedStep = 32
 )
+
+// screenLogger renders the PTY output stream on a virtual terminal and
+// writes a readable text log:
+//
+//   - On the normal screen, lines are written as they scroll off the top,
+//     so plain line output (build logs, command output, shell sessions)
+//     is preserved in full, in order.
+//   - On the alternate screen (watch, vim, less, ...), timestamped
+//     snapshots of the visible screen are written instead, so full-screen
+//     commands leave a readable log rather than raw escape sequences.
+type screenLogger struct {
+	mu      sync.Mutex
+	file    *os.File
+	vt      vt10x.Terminal
+	pending []byte // trailing bytes of an incomplete UTF-8 rune
+
+	alt bool // the child is using the alternate screen
+
+	// Alternate screen: frame snapshots.
+	lastFrame string
+	dirty     bool
+	lastRecv  time.Time
+	lastWrite time.Time
+
+	// Normal screen: stream of scrolled-off lines.
+	prev     []string // last sampled screen lines
+	prevInit bool
+	emitted  int // lines at the top of prev already written to the log
+}
+
+func newScreenLogger(file *os.File, cols, rows int) *screenLogger {
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+	return &screenLogger{
+		file: file,
+		vt:   vt10x.New(vt10x.WithSize(cols, rows)),
+	}
+}
+
+// Feed consumes raw PTY output.
+func (s *screenLogger) Feed(p []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data := append(s.pending, p...)
+	for len(data) > 0 {
+		step := len(data)
+		if !s.inAltLocked() && step > feedStep {
+			step = feedStep
+		}
+		n, err := s.vt.Write(data[:step])
+		if err != nil {
+			log.Printf("failed to write to virtual terminal, err=%v", err)
+		}
+		if n == 0 {
+			// Incomplete UTF-8 rune at the end; keep the bytes for the
+			// next Feed.
+			break
+		}
+		data = data[n:]
+		s.sampleLocked()
+	}
+	s.pending = data
+
+	s.lastRecv = time.Now()
+}
+
+// Resize resizes the virtual terminal to follow the real terminal.
+func (s *screenLogger) Resize(cols, rows int) {
+	if cols <= 0 || rows <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, r := s.vt.Size()
+	if c == cols && r == rows {
+		return
+	}
+	s.vt.Resize(cols, rows)
+
+	if s.alt {
+		s.dirty = true
+		s.lastRecv = time.Now()
+		return
+	}
+	// Reflow makes stream tracking unreliable: flush what is on screen
+	// and start a new baseline.
+	s.flushStreamLocked()
+	s.prev = s.screenLinesLocked()
+	s.prevInit = true
+	s.emitted = len(s.prev)
+}
+
+func (s *screenLogger) inAltLocked() bool {
+	return s.vt.Mode()&vt10x.ModeAltScreen != 0
+}
+
+// screenLinesLocked returns the visible screen as right-trimmed lines,
+// with trailing blank lines dropped.
+func (s *screenLogger) screenLinesLocked() []string {
+	lines := strings.Split(s.vt.String(), "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t\r")
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+// sampleLocked updates the log after new output was fed to the terminal.
+func (s *screenLogger) sampleLocked() {
+	if alt := s.inAltLocked(); alt != s.alt {
+		if alt {
+			// Entering the alternate screen: flush the normal screen
+			// lines that have not been written yet.
+			s.flushStreamLocked()
+			s.dirty = true
+			s.lastRecv = time.Now()
+		} else {
+			// Back on the normal screen: its content was restored and
+			// has already been logged.
+			s.prev = s.screenLinesLocked()
+			s.prevInit = true
+			s.emitted = len(s.prev)
+		}
+		s.alt = alt
+		return
+	}
+
+	if s.alt {
+		s.dirty = true
+		s.lastRecv = time.Now()
+		return
+	}
+
+	cur := s.screenLinesLocked()
+	if !s.prevInit {
+		s.prev = cur
+		s.prevInit = true
+		s.emitted = 0
+		return
+	}
+	if equalLines(cur, s.prev) {
+		return
+	}
+
+	if k, ok := scrollAmount(s.prev, cur); ok {
+		if k > s.emitted {
+			s.writeLinesLocked(s.prev[s.emitted:k])
+		}
+		s.emitted -= k
+		if s.emitted < 0 {
+			s.emitted = 0
+		}
+		s.prev = cur
+		return
+	}
+
+	// A change confined to the last line (typing at a prompt, a progress
+	// bar) is still being edited; it is logged once it scrolls off or at
+	// the end.
+	if lastLineOnlyChange(s.prev, cur) {
+		s.prev = cur
+		return
+	}
+
+	// Anything else (in-place redraws, clears): keep a framed snapshot.
+	s.writeFrameLocked(cur)
+	s.prev = cur
+	s.emitted = len(cur)
+}
+
+// maybeSnapshot writes a frame on the alternate screen if the screen
+// changed and output settled. Called periodically.
+func (s *screenLogger) maybeSnapshot() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.alt || !s.dirty {
+		return
+	}
+
+	frame := strings.Join(s.screenLinesLocked(), "\n")
+	if frame == "" || frame == s.lastFrame {
+		s.dirty = false
+		return
+	}
+
+	now := time.Now()
+	if now.Sub(s.lastRecv) < snapshotSettle && now.Sub(s.lastWrite) < snapshotMaxDelay {
+		// Output is still flowing; wait for it to settle.
+		return
+	}
+	s.writeFrameLocked(s.screenLinesLocked())
+	s.dirty = false
+	s.lastWrite = now
+}
+
+// flush writes whatever is still on screen when the command ends.
+func (s *screenLogger) flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.alt {
+		s.writeFrameLocked(s.screenLinesLocked())
+		return
+	}
+	s.flushStreamLocked()
+}
+
+// flushStreamLocked writes the normal-screen lines that have not been
+// written yet.
+func (s *screenLogger) flushStreamLocked() {
+	if s.prevInit && s.emitted < len(s.prev) {
+		s.writeLinesLocked(s.prev[s.emitted:])
+		s.emitted = len(s.prev)
+	}
+}
+
+func (s *screenLogger) writeLinesLocked(lines []string) {
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(s.file, line); err != nil {
+			log.Printf("failed to write log line, err=%v", err)
+		}
+	}
+}
+
+func (s *screenLogger) writeFrameLocked(lines []string) {
+	frame := strings.Join(lines, "\n")
+	if frame == "" || frame == s.lastFrame {
+		return
+	}
+	if _, err := fmt.Fprintf(s.file, "===== %s =====\n%s\n", time.Now().Format(snapshotTimeFormat), frame); err != nil {
+		log.Printf("failed to write snapshot, err=%v", err)
+	}
+	s.lastFrame = frame
+}
+
+func equalLines(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// scrollAmount returns how many lines prev scrolled up to become cur:
+// prev[k:] must be a prefix of cur. The trivial match k == len(prev)
+// (everything scrolled away) always succeeds as a fallback.
+func scrollAmount(prev, cur []string) (int, bool) {
+	for k := 0; k <= len(prev); k++ {
+		rest := prev[k:]
+		if len(rest) > len(cur) {
+			continue
+		}
+		if equalLines(rest, cur[:len(rest)]) {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+// lastLineOnlyChange reports whether prev and cur differ only in their
+// last line.
+func lastLineOnlyChange(prev, cur []string) bool {
+	if len(prev) == 0 || len(prev) != len(cur) {
+		return false
+	}
+	return equalLines(prev[:len(prev)-1], cur[:len(cur)-1])
+}
 
 var (
 	ErrNotFoundCmd  = errors.New("a command is required")
@@ -42,12 +336,22 @@ func record(_ context.Context, file *os.File, argv []string) error {
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 
-	ptmx, err := pty.Start(cmd)
+	cols, rows, sizeErr := term.GetSize(os.Stdin.Fd())
+
+	var ptmx *os.File
+	var err error
+	if sizeErr == nil {
+		ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	} else {
+		ptmx, err = pty.Start(cmd)
+	}
 	if err != nil {
 		log.Printf("failed to start command, err=%v", err)
 		return err
 	}
 	defer ptmx.Close()
+
+	logger := newScreenLogger(file, cols, rows)
 
 	// Terminal raw mode
 	oldState, err := term.MakeRaw(os.Stdin.Fd())
@@ -75,8 +379,15 @@ func record(_ context.Context, file *os.File, argv []string) error {
 				_ = cmd.Wait()
 				log.Printf("failed to resize pty, err=%v", err)
 			}
+			if w, h, err := term.GetSize(os.Stdin.Fd()); err == nil {
+				logger.Resize(w, h)
+			}
 		}
 	}()
+
+	// Apply the initial size (PTY and virtual terminal) right away,
+	// so full-screen commands start with the real terminal size.
+	ch <- syscall.SIGWINCH
 
 	// Stdin -> PTY
 	go func() {
@@ -87,21 +398,50 @@ func record(_ context.Context, file *os.File, argv []string) error {
 
 	var eg errgroup.Group
 
-	// PTY -> Stdout, Log
+	// PTY -> Stdout, Log (as readable text)
 	eg.Go(func() error {
-		writer := bufio.NewWriter(file)
-
-		defer func() {
-			if err := writer.Flush(); err != nil {
-				log.Printf("failed to flush buffer, err=%v", err)
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(snapshotInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					logger.maybeSnapshot()
+				}
 			}
 		}()
 
-		if _, err := io.Copy(io.MultiWriter(os.Stdout, writer), ptmx); err != nil && !errors.Is(err, syscall.EIO) {
-			log.Printf("faild to copy pty stdout and logfile, err=%v", err)
-			return err
+		var copyErr error
+		buf := make([]byte, 1024)
+		for {
+			n, readErr := ptmx.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				if _, err := os.Stdout.Write(chunk); err != nil {
+					log.Printf("failed to copy pty stdout, err=%v", err)
+				}
+				logger.Feed(chunk)
+			}
+			if readErr != nil {
+				if !errors.Is(readErr, syscall.EIO) && !errors.Is(readErr, io.EOF) {
+					log.Printf("faild to copy pty stdout and logfile, err=%v", readErr)
+					copyErr = readErr
+				}
+				break
+			}
 		}
-		return nil
+
+		close(done)
+		wg.Wait()
+		logger.flush()
+
+		return copyErr
 	})
 
 	// wait to finish command
