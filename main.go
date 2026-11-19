@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,8 +69,11 @@ type screenLogger struct {
 
 	// Normal screen: stream of scrolled-off lines.
 	prev     []string // last sampled screen lines
+	prevY    int      // cursor row at the time prev was sampled
 	prevInit bool
 	emitted  int // lines at the top of prev already written to the log
+
+	stepNewlines int // newlines fed since the previous sample
 }
 
 func newScreenLogger(file *os.File, cols, rows int) *screenLogger {
@@ -93,8 +97,17 @@ func (s *screenLogger) Feed(p []byte) {
 	data := append(s.pending, p...)
 	for len(data) > 0 {
 		step := len(data)
-		if !s.inAltLocked() && step > feedStep {
-			step = feedStep
+		if !s.inAltLocked() {
+			// On the normal screen, feed at most one completed line
+			// at a time and sample after each: a line that is both
+			// completed and scrolled off between two samples would
+			// never appear in either of them and would be lost.
+			if step > feedStep {
+				step = feedStep
+			}
+			if i := bytes.IndexByte(data[:step], '\n'); i >= 0 {
+				step = i + 1
+			}
 		}
 		n, err := s.vt.Write(data[:step])
 		if err != nil {
@@ -105,6 +118,7 @@ func (s *screenLogger) Feed(p []byte) {
 			// next Feed.
 			break
 		}
+		s.stepNewlines += bytes.Count(data[:n], []byte{'\n'})
 		data = data[n:]
 		s.sampleLocked()
 	}
@@ -137,6 +151,7 @@ func (s *screenLogger) Resize(cols, rows int) {
 	// and start a new baseline.
 	s.flushStreamLocked()
 	s.prev = s.screenLinesLocked()
+	s.prevY = s.vt.Cursor().Y
 	s.prevInit = true
 	s.emitted = len(s.prev)
 }
@@ -171,6 +186,7 @@ func (s *screenLogger) sampleLocked() {
 			// Back on the normal screen: its content was restored and
 			// has already been logged.
 			s.prev = s.screenLinesLocked()
+			s.prevY = s.vt.Cursor().Y
 			s.prevInit = true
 			s.emitted = len(s.prev)
 		}
@@ -185,17 +201,27 @@ func (s *screenLogger) sampleLocked() {
 	}
 
 	cur := s.screenLinesLocked()
+	curY := s.vt.Cursor().Y
+	// Lines can only scroll off when new lines are completed, so the
+	// newlines fed since the previous sample bound the scroll amount.
+	// This is what tells a genuine "everything scrolled away" apart
+	// from an in-place redraw that replaced the whole screen.
+	maxScroll := s.stepNewlines
+	s.stepNewlines = 0
 	if !s.prevInit {
 		s.prev = cur
+		s.prevY = curY
 		s.prevInit = true
 		s.emitted = 0
 		return
 	}
 	if equalLines(cur, s.prev) {
+		s.prevY = curY
 		return
 	}
 
-	if k, ok := scrollAmount(s.prev, cur); ok {
+	body := completeLines(s.prev, s.prevY)
+	if k, ok := scrollAmount(s.prev, cur, body, maxScroll); ok {
 		if k > s.emitted {
 			s.writeLinesLocked(s.prev[s.emitted:k])
 		}
@@ -204,21 +230,55 @@ func (s *screenLogger) sampleLocked() {
 			s.emitted = 0
 		}
 		s.prev = cur
+		s.prevY = curY
 		return
 	}
 
-	// A change confined to the last line (typing at a prompt, a progress
-	// bar) is still being edited; it is logged once it scrolls off or at
-	// the end.
-	if lastLineOnlyChange(s.prev, cur) {
+	// Growth (complete lines unchanged, the last line may still be
+	// extended) or a change confined to the last line (typing at a
+	// prompt, a progress bar): nothing has scrolled off, and the last
+	// line is still being edited. It is logged once it scrolls off or
+	// at the end.
+	if isGrowth(s.prev, cur, body) || lastLineOnlyChange(s.prev, cur) {
 		s.prev = cur
+		s.prevY = curY
 		return
 	}
 
 	// Anything else (in-place redraws, clears): keep a framed snapshot.
 	s.writeFrameLocked(cur)
 	s.prev = cur
+	s.prevY = curY
 	s.emitted = len(cur)
+}
+
+// completeLines returns how many of the sampled lines are known to be
+// complete. The cursor sits on the line still being written; when it
+// has moved below the last content line (the usual case right after a
+// newline), every line is complete. Otherwise the last line is
+// provisional: it may be extended by the next output, so comparisons
+// must not rely on it.
+func completeLines(lines []string, cursorY int) int {
+	if cursorY >= len(lines) {
+		return len(lines)
+	}
+	if len(lines) == 0 {
+		return 0
+	}
+	return len(lines) - 1
+}
+
+// isGrowth reports whether cur is prev with more lines appended: all
+// complete lines of prev are unchanged at the top of cur (the
+// provisional last line may have been extended since it was sampled).
+func isGrowth(prev, cur []string, body int) bool {
+	if len(cur) < body {
+		return false
+	}
+	if body == len(prev) && len(cur) < len(prev) {
+		return false
+	}
+	return equalLines(prev[:body], cur[:body])
 }
 
 // maybeSnapshot writes a frame on the alternate screen if the screen
@@ -300,11 +360,23 @@ func equalLines(a, b []string) bool {
 }
 
 // scrollAmount returns how many lines prev scrolled up to become cur:
-// prev[k:] must be a prefix of cur. The trivial match k == len(prev)
-// (everything scrolled away) always succeeds as a fallback.
-func scrollAmount(prev, cur []string) (int, bool) {
-	for k := 0; k <= len(prev); k++ {
-		rest := prev[k:]
+// prev[k:body] must be a prefix of cur, where body is the number of
+// complete lines in prev (see completeLines). The provisional last
+// line is excluded from the match: sampled in the middle of a step,
+// it may have been completed since, which would poison an exact
+// comparison and make a small scroll look like a full screen
+// replacement.
+//
+// k is at most maxScroll: only completed new lines can push lines off
+// the top, so a larger k would mean the screen was redrawn in place
+// rather than scrolled.
+func scrollAmount(prev, cur []string, body int, maxScroll int) (int, bool) {
+	maxK := body
+	if maxScroll < maxK {
+		maxK = maxScroll
+	}
+	for k := 0; k <= maxK; k++ {
+		rest := prev[k:body]
 		if len(rest) > len(cur) {
 			continue
 		}
@@ -336,15 +408,9 @@ func record(_ context.Context, file *os.File, argv []string) error {
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 
-	cols, rows, sizeErr := term.GetSize(os.Stdin.Fd())
+	cols, rows, _ := term.GetSize(os.Stdin.Fd())
 
-	var ptmx *os.File
-	var err error
-	if sizeErr == nil {
-		ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-	} else {
-		ptmx, err = pty.Start(cmd)
-	}
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Printf("failed to start command, err=%v", err)
 		return err
