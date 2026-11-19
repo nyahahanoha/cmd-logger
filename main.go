@@ -78,6 +78,9 @@ func record(_ context.Context, file *os.File, argv []string) error {
 		}
 	}()
 
+	// Initial resize
+	ch <- syscall.SIGWINCH
+
 	// Stdin -> PTY
 	go func() {
 		if _, err := io.Copy(ptmx, os.Stdin); err != nil {
